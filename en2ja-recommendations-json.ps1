@@ -65,6 +65,9 @@ function Get-ReplacedRecommendationWithHash {
             $recommendationInJson.learnMoreLink[0].url = $recommendationInHash.learnMoreLink[0].url
             $recommendationInJson.learnMoreLink[0].name = $recommendationInHash.learnMoreLink[0].name
         }
+        else {
+            Write-Host ('{0} is not in the recommendation hash.' -f $recommendationInJson.aprlGuid)
+        }
         $recommendationInJson
     }
 }
