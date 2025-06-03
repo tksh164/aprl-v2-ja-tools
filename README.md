@@ -16,4 +16,4 @@ $filePaths | .\recomm-yaml-translator.ps1 -TranslateFrom $from -TranslateTo $to 
 ### Notes
 
 - This script requires a [Translator resource](https://learn.microsoft.com/azure/ai-services/translator/text-translation/quickstart/rest-api) on Azure to run.
-- Check the translation result recommended because sometimes the machine translation result's quality is not good.
+- Review the machine translation result before use it recommended because sometimes the machine translation result's quality is not good.
