@@ -1,6 +1,14 @@
+#Requires -Version 7
+
 param (
     [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
     [string[]] $RecommendationYamlFilePath,
+
+    [Parameter(Mandatory = $true)]
+    [string] $TranslateFrom,
+
+    [Parameter(Mandatory = $true)]
+    [string] $TranslateTo,
 
     [Parameter(Mandatory = $true)]
     [string] $ApiKey,
@@ -15,99 +23,160 @@ param (
     [switch] $Overwrite
 )
 
-begin
-{
-    function Test-RecommendationBlockStart
-    {
+begin {
+    $ErrorActionPreference = 'Stop'
+
+    function Invoke-RecommendationYamlTranslation {
+        [CmdletBinding()]
+        param (
+            [Parameter(Mandatory = $true)]
+            [string] $YamlFilePath,
+
+            [Parameter(Mandatory = $true)]
+            [string] $TranslateFrom,
+
+            [Parameter(Mandatory = $true)]
+            [string] $TranslateTo,
+
+            [Parameter(Mandatory = $true)]
+            [string] $ApiKey,
+
+            [Parameter(Mandatory = $true)]
+            [string] $Location,
+
+            [Parameter(Mandatory = $true)]
+            [string] $ApiEndpoint
+        )
+
+        # The properties that need to be translated.
+        $targetPropertyNames = @(
+            'description',
+            'potentialBenefits',
+            'longDescription'
+        )
+
+        $yamlLines = Get-Content -Encoding utf8 -LiteralPath $yamlFilePath
+
+        # NOTE: Use line by line processing approach to minimize differences as text.
+        $translatedYamlBuilder = New-Object -TypeName 'System.Text.StringBuilder'
+        $currentLineNum = 0
+        $sourceTextPlaceholderPairs = @()
+        while ($currentLineNum -lt $yamlLines.Length) {
+            $lineProperty = Get-YamlLineProperty -Line $yamlLines[$currentLineNum]
+            $shouldTranslateSingleLineValue = (-not [string]::IsNullOrWhiteSpace($lineProperty.TranslateChunk)) -and ($targetPropertyNames -contains $lineProperty.PropertyName)
+
+            if ($shouldTranslateSingleLineValue -or $lineProperty.IsPartOfMultiline) {
+                # Hold the text to translate and placeholder pairs to reduce the number of API calls.
+                $stpPair = New-SourceTextPlaceholderPair -TextToTranslate $lineProperty.TranslateChunk
+                $sourceTextPlaceholderPairs += $stpPair
+                [void] $translatedYamlBuilder.AppendLine($lineProperty.NonTranslateChunk + $stpPair.Placeholder)
+            }
+            else {
+                [void] $translatedYamlBuilder.AppendLine($lineProperty.Line)
+            }
+            $currentLineNum++
+        }
+
+        # Create a request body for the translation API call.
+        $requestBodyContent = @()
+        $requestBodyContent += foreach ($pair in $sourceTextPlaceholderPairs) {
+            @{ 'Text' = $pair.TextToTranslate }
+        }
+
+        # Call the translation API.
+        $params = @{
+            RequestBody   = $requestBodyContent | ConvertTo-Json
+            TranslateFrom = $TranslateFrom
+            TranslateTo   = $TranslateTo
+            ApiKey        = $ApiKey
+            Location      = $Location
+            ApiEndpoint   = $ApiEndpoint
+        }
+        $translatedResult = Invoke-Translation @params
+
+        # Replace the placeholders with the translated texts.
+        $translatedYaml = $translatedYamlBuilder.ToString()
+        for ($i = 0; $i -lt $translatedResult.translations.Length; $i++) {
+            $translatedYaml = $translatedYaml.Replace($sourceTextPlaceholderPairs[$i].Placeholder, $translatedResult.translations[$i].text)
+        }
+
+        # Remove the last newline character to respect the original count of newline characters.
+        $translatedYaml = $translatedYaml.Substring(0, $translatedYaml.Length - [System.Environment]::NewLine.Length)
+
+        return $translatedYaml
+    }
+
+    function Get-YamlLineProperty {
         [CmdletBinding()]
         param (
             [Parameter(Mandatory = $true)][AllowEmptyString()]
             [string] $Line
         )
-    
-        return $Line -match '^\-\s*description:.+$'
-    }
-    
-    function Get-RecommendationBlockEndLineNum
-    {
-        [CmdletBinding()]
-        param (
-            [Parameter(Mandatory = $true)][AllowEmptyString()]
-            [string[]] $YamlLines,
-    
-            [Parameter(Mandatory = $true)]
-            [int] $StartLineNum
-        )
-    
-        $blockEndLineNum = -1
-        for ($currentLineNum = $StartLineNum + 1; $currentLineNum -lt $YamlLines.Length; $currentLineNum++) {
-            $currentLine = $YamlLines[$currentLineNum]
-            if (Test-RecommendationBlockStart -Line $currentLine) {
-                $blockEndLineNum = $currentLineNum
-                break
-            }
-        }
-    
-        if ($blockEndLineNum -lt 0) {
-            $blockEndLineNum = $YamlLines.Length
-        }
-    
-        return $blockEndLineNum
-    }
-    
-    function Get-TextToTranslate
-    {
-        [CmdletBinding()]
-        param (
-            [Parameter(Mandatory = $true)][AllowEmptyString()]
-            [string[]] $YamlLines,
-    
-            [Parameter(Mandatory = $true)]
-            [int] $StartLineNum,
-    
-            [Parameter(Mandatory = $true)]
-            [int] $EndLineNum
-        )
-    
+
         $result = [PSCustomObject] @{
-            Description     = ''
-            LongDescription = ''
+            Line              = $Line
+            PropertyName      = $null
+            IsPartOfMultiline = $false
+            NonTranslateChunk = $null
+            TranslateChunk    = $null
         }
-    
-        $currentLineNum = $StartLineNum
-        while ($currentLineNum -lt $EndLineNum) {
-            $currentLine = $YamlLines[$currentLineNum]
-    
-            # description
-            if ($currentLine -match '^\-\s*description:\s*(.+)$') {
-                $result.Description = $Matches[1]
-                $currentLineNum++
-            }
-            # longDescription
-            elseif ($currentLine -match '^\s+longDescription:\s*\|\s*$') {
-                $nextLine = $YamlLines[$currentLineNum + 1]
-                if ($nextLine -match '^\s+(.+)$') {
-                    $result.LongDescription = $Matches[1]
-                    $currentLineNum = $currentLineNum + 2
-                }
-                else {
-                    throw 'Unexpected mismatch on "longDescription". The line was "{0}".' -f $nextLine
-                }
+
+        if ([string]::IsNullOrWhiteSpace($Line)) {
+            return $result
+        }
+
+        if ($Line -match '^\s*[\-]*\s*([^:]+)\:\s*[\|]*.*$') {
+            $result.PropertyName = $Matches[1]
+        }
+        else {
+            $result.IsPartOfMultiline = $true
+        }
+
+        if ($result.IsPartOfMultiline) {
+            if ($Line -match '^(\s*)(.+)$') {
+                $result.NonTranslateChunk = $Matches[1]
+                $result.TranslateChunk = $Matches[2]
             }
             else {
-                $currentLineNum++
+                throw 'Unexpected line format as a part of multi-lines: "{0}"' -f $Line
             }
         }
-    
+        else {
+            if ($Line -match '^(\s*[\-]*\s*[^:]+\:\s*[\|]*)(.*)$') {
+                $result.NonTranslateChunk = $Matches[1]
+                $result.TranslateChunk = $Matches[2]
+            }
+            else {
+                throw 'Unexpected line format as a single line: "{0}"' -f $Line
+            }
+        }
         return $result
     }
-    
-    function Invoke-Translation
-    {
+
+    function New-SourceTextPlaceholderPair {
         [CmdletBinding()]
         param (
             [Parameter(Mandatory = $true)]
-            [PSCustomObject] $TextToTranslate,
+            [string] $TextToTranslate
+        )
+
+        return [PSCustomObject] @{
+            TextToTranslate = $TextToTranslate
+            Placeholder     = '{{{' + (New-Guid).ToString() + '}}}'
+        }
+    }
+
+    function Invoke-Translation {
+        [CmdletBinding()]
+        param (
+            [Parameter(Mandatory = $true)]
+            [string] $RequestBody,
+
+            [Parameter(Mandatory = $true)]
+            [string] $TranslateFrom,
+
+            [Parameter(Mandatory = $true)]
+            [string] $TranslateTo,
 
             [Parameter(Mandatory = $true)]
             [string] $ApiKey,
@@ -119,30 +188,25 @@ begin
             [string] $ApiEndpoint
         )
     
-        $from = 'en'
-        $to = 'ja'
         $params = @{
             Method  = 'Post'
-            Uri     = '{0}/translate?api-version=3.0&from={1}&to={2}' -f $ApiEndpoint, $from, $to
+            Uri     = '{0}/translate?api-version=3.0&textType=plain&from={1}&to={2}' -f $ApiEndpoint, $TranslateFrom, $TranslateTo
             Headers = @{
                 'Content-Type'                 = 'application/json'
                 'Ocp-Apim-Subscription-Key'    = $ApiKey
                 'Ocp-Apim-Subscription-Region' = $Location
             }
-            Body = ,@(
-                @{ 'Text' = $TextToTranslate.Description }
-                @{ 'Text' = $TextToTranslate.LongDescription }
-            ) | ConvertTo-Json
+            Body    = $RequestBody
         }
 
-        $maxRetryCount = 3
-        for ($retried = 0; $retried -lt $maxRetryCount; $retried++) {
+        $maxAttempts = 3
+        $waitSeconds = 15
+        for ($attempts = 0; $attempts -lt $maxAttempts; $attempts++) {
             try {
                 $result = Invoke-RestMethod @params
             }
             catch {
                 if (($_.Exception -is [System.Net.Http.HttpRequestException]) -and ($_.Exception.Message -like '*established connection failed*')) {
-                    $waitSeconds = 15
                     Write-Host -Object ('Failed the translator API call. Will retrying after waiting {0} seconds...' -f $waitSeconds) -ForegroundColor Yellow
                     Start-Sleep -Seconds $waitSeconds
                 }
@@ -151,70 +215,10 @@ begin
                 }
             }
         }
-
-        return [PSCustomObject] @{
-            Description     = $result.translations[0].text
-            LongDescription = $result.translations[1].text
-        }
-    }
-    
-    function New-TranslatedRecommendationBlock
-    {
-        [CmdletBinding()]
-        param (
-            [Parameter(Mandatory = $true)][AllowEmptyString()]
-            [string[]] $YamlLines,
-    
-            [Parameter(Mandatory = $true)]
-            [int] $StartLineNum,
-    
-            [Parameter(Mandatory = $true)]
-            [int] $EndLineNum,
-    
-            [Parameter(Mandatory = $true)]
-            [PSCustomObject] $TranslatedText
-        )
-        
-        $yamlBlockBuilder = New-Object -TypeName 'System.Text.StringBuilder'
-        $currentLineNum = $StartLineNum
-        while ($currentLineNum -lt $EndLineNum) {
-            $currentLine = $YamlLines[$currentLineNum]
-    
-            # description
-            if ($currentLine -match '^(\-\s*description:\s*).+$') {
-                [void] $yamlBlockBuilder.AppendLine($Matches[1] + $TranslatedText.Description)
-                $currentLineNum++
-            }
-            # longDescription
-            elseif ($currentLine -match '^\s+longDescription:\s*\|\s*$') {
-                $nextLine = $YamlLines[$currentLineNum + 1]
-                if ($nextLine -match '^(\s+).+$') {
-                    [void] $yamlBlockBuilder.AppendLine($currentLine)
-                    [void] $yamlBlockBuilder.AppendLine($Matches[1] + $TranslatedText.LongDescription)
-                    $currentLineNum = $currentLineNum + 2
-                }
-                else {
-                    throw 'Unexpected mismatch on "longDescription". The line was "{0}".' -f $nextLine
-                }
-            }
-            # learnMoreLink.url
-            elseif ($currentLine -match '^(\s+url:\s*)(.+)$') {
-                $headPart = $Matches[1]
-                $urlPart = $Matches[2].Replace('/en-us/', '/ja-jp/')
-                [void] $yamlBlockBuilder.AppendLine($headPart + $urlPart)
-                $currentLineNum++
-            }
-            # other lines
-            else {
-                [void] $yamlBlockBuilder.AppendLine($currentLine)
-                $currentLineNum++
-            }
-        }
-        return $yamlBlockBuilder.ToString()
+        return $result
     }
 
-    function New-OutputYamlFileName
-    {
+    function New-OutputYamlFileName {
         [CmdletBinding()]
         param (
             [Parameter(Mandatory = $true)]
@@ -227,26 +231,24 @@ begin
         $outputFileName = $fileNameWithoutExtension + '.mt' + $extension
         return [System.IO.Path]::Combine($parentPath, $outputFileName)
     }
+}
 
-    function New-ExceptionMessage
-    {
-        param (
-            [Parameter(Mandatory = $true)]
-            [System.Management.Automation.ErrorRecord] $ErrorRecord
-        )
-
+process {
+    trap {
         $ex = $_.Exception
         $builder = New-Object -TypeName 'System.Text.StringBuilder'
         [void] $builder.AppendLine('')
 
-        [void] $builder.AppendLine('>>> EXCEPTION <<<')
+        [void] $builder.AppendLine('**** EXCEPTION ****')
         [void] $builder.AppendLine($ex.Message)
+        [void] $builder.AppendLine('')
         [void] $builder.AppendLine('Exception: ' + $ex.GetType().FullName)
         [void] $builder.AppendLine('FullyQualifiedErrorId: ' + $_.FullyQualifiedErrorId)
         [void] $builder.AppendLine('ErrorDetailsMessage: ' + $_.ErrorDetails.Message)
         [void] $builder.AppendLine('CategoryInfo: ' + $_.CategoryInfo.ToString())
-        [void] $builder.AppendLine('StackTrace in PowerShell:')
+        [void] $builder.AppendLine('PowerShell StackTrace:')
         [void] $builder.AppendLine($_.ScriptStackTrace)
+        [void] $builder.AppendLine('')
 
         [void] $builder.AppendLine('--- Exception ---')
         [void] $builder.AppendLine('Exception: ' + $ex.GetType().FullName)
@@ -256,10 +258,10 @@ begin
         [void] $builder.AppendLine('StackTrace:')
         [void] $builder.AppendLine($ex.StackTrace)
 
-        $level = 1
+        $depth = 1
         while ($ex.InnerException) {
             $ex = $ex.InnerException
-            [void] $builder.AppendLine('--- InnerException {0} ---' -f $level)
+            [void] $builder.AppendLine('--- InnerException {0} ---' -f $depth)
             [void] $builder.AppendLine('Exception: ' + $ex.GetType().FullName)
             [void] $builder.AppendLine('Message: ' + $ex.Message)
             [void] $builder.AppendLine('Source: ' + $ex.Source)
@@ -267,52 +269,34 @@ begin
             [void] $builder.AppendLine('StackTrace:')
             [void] $builder.AppendLine($ex.StackTrace)
             [void] $builder.AppendLine('---')
-            $level++
+            $depth++
         }
 
-        return $builder.ToString()
+        $message = $builder.ToString()
+        Write-Host -Object $message -ForegroundColor Yellow
     }
-}
 
-process
-{
     foreach ($yamlFilePath in $RecommendationYamlFilePath) {
-        try {
-            Write-Host ("Translate:`t""{0}""" -f $yamlFilePath)
-            $resultYamlBuilder = New-Object -TypeName 'System.Text.StringBuilder'
-    
-            $yamlLines = Get-Content -Encoding UTF8 -LiteralPath $yamlFilePath
-            $currentLineNum = 0
-            while ($currentLineNum -lt $yamlLines.Length) {
-                $currentLine = $yamlLines[$currentLineNum]
-                if (Test-RecommendationBlockStart -Line $currentLine) {
-                    $currentBlockEndLineNum = Get-RecommendationBlockEndLineNum -YamlLines $yamlLines -StartLineNum $currentLineNum
-                    $textToTranslate = Get-TextToTranslate -YamlLines $yamlLines -StartLineNum $currentLineNum -EndLineNum $currentBlockEndLineNum
-                    $translatedText = Invoke-Translation -TextToTranslate $textToTranslate -ApiKey $ApiKey -Location $Location -ApiEndpoint $ApiEndpoint
-                    $translatedBlock = New-TranslatedRecommendationBlock -YamlLines $yamlLines -StartLineNum $currentLineNum -EndLineNum $currentBlockEndLineNum -TranslatedText $translatedText
-                    [void] $resultYamlBuilder.Append($translatedBlock)
-                    $currentLineNum = $currentBlockEndLineNum
-                }
-                else {
-                    $currentLineNum++
-                }
-            }
-    
-            if ($Overwrite) {
-                $outputYamlFilePath = $yamlFilePath
-            }
-            else {
-                $outputYamlFilePath = New-OutputYamlFileName -YamlFilePath $yamlFilePath
-            }
-            $resultYamlBuilder.ToString().TrimEnd() | Set-Content -Encoding UTF8 -LiteralPath $outputYamlFilePath -Force
-            Write-Host ("Output:`t`t""{0}""" -f $outputYamlFilePath)
+        Write-Host ("Translate: ""{0}""" -f $yamlFilePath)
+        $params = @{
+            YamlFilePath  = $yamlFilePath
+            TranslateFrom = $TranslateFrom
+            TranslateTo   = $TranslateTo
+            ApiKey        = $ApiKey
+            Location      = $Location
+            ApiEndpoint   = $ApiEndpoint
         }
-        catch {
-            throw New-ExceptionMessage -ErrorRecord $_
+        $translatedYaml = Invoke-RecommendationYamlTranslation @params
+
+        $outputYamlFilePath = if ($Overwrite) {
+            $yamlFilePath
         }
+        else {
+            New-OutputYamlFileName -YamlFilePath $yamlFilePath
+        }
+        $translatedYaml | Set-Content -Encoding UTF8 -LiteralPath $outputYamlFilePath -Force
+        Write-Host ("Output   : ""{0}""" -f $outputYamlFilePath)
     }
 }
 
-end
-{
-}
+end {}
